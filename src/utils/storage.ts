@@ -124,10 +124,9 @@ export async function syncOfficerFromSheets(): Promise<OfficerProfile | null> {
 }
 
 export async function syncWebhookUrlFromSheets(): Promise<string | null> {
-  const raw = await fetchFromSheets('webhookUrl');
-  if (!raw) return null;
-  localStorage.setItem(STORAGE_KEYS.WEBHOOK_URL, raw);
-  return raw;
+  // ยกเลิกการดึงและเก็บ Webhook URL ไว้ในเบราว์เซอร์เพื่อความปลอดภัย
+  localStorage.removeItem(STORAGE_KEYS.WEBHOOK_URL);
+  return null;
 }
 
 // ── Synchronous load (from localStorage, with fallback to initial data) ──
@@ -232,11 +231,7 @@ export function saveOfficer(officer: OfficerProfile) {
 }
 
 export function loadWebhookUrl(): string {
-  try {
-    return localStorage.getItem(STORAGE_KEYS.WEBHOOK_URL) || '';
-  } catch {
-    return '';
-  }
+  return '';
 }
 
 export function saveWebhookUrl(url: string) {
@@ -331,8 +326,7 @@ export function exportAllData(): string {
     if (c) data.categories = JSON.parse(c);
     const o = localStorage.getItem(STORAGE_KEYS.OFFICER);
     if (o) data.officer = JSON.parse(o);
-    const w = localStorage.getItem(STORAGE_KEYS.WEBHOOK_URL);
-    if (w) data.webhookUrl = w;
+    // ยกเลิกการส่งออก webhookUrl เพื่อความปลอดภัย
     const e = localStorage.getItem(STORAGE_KEYS.SUPER_ADMIN_EMAILS);
     if (e) data.superAdminEmails = JSON.parse(e);
     data.exportedAt = new Date().toISOString();
