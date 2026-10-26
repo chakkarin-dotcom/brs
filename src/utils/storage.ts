@@ -13,9 +13,9 @@ const STORAGE_KEYS = {
 function getScriptUrl(): string {
   try {
     // ชี้ปลายทางมาที่ Cloudflare Worker แทน Google Apps Script
-    return (import.meta as any).env?.VITE_WORKER_API_URL || 'https://building-repair-system.chakkarin.workers.dev';
+    return (import.meta as any).env?.VITE_WORKER_API_URL || 'https://building-repair-api.chakkarin.workers.dev';
   } catch {
-    return 'https://building-repair-system.chakkarin.workers.dev';
+    return 'https://building-repair-api.chakkarin.workers.dev';
   }
 }
 
