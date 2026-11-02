@@ -1,5 +1,5 @@
 import { INITIAL_CATEGORIES, INITIAL_OFFICER, INITIAL_TICKETS } from '../data/initialData';
-import { MaintenanceCategory, MaintenanceTicket, OfficerProfile, SystemRating } from '../types';
+import { MaintenanceCategory, MaintenanceTicket, OfficerProfile, SystemRating, TicketStatus } from '../types';
 
 const STORAGE_KEYS = {
   CATEGORIES: 'kku_pojsarasin_categories_v1',
@@ -9,6 +9,87 @@ const STORAGE_KEYS = {
   SUPER_ADMIN_EMAILS: 'kku_pojsarasin_super_admin_emails_v1',
   SYSTEM_RATINGS: 'kku_pojsarasin_system_ratings_v1',
 };
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function asString(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function normalizeTicket(value: unknown, index: number): MaintenanceTicket {
+  const ticket = asRecord(value);
+  const location = asRecord(ticket.location);
+  const reporter = asRecord(ticket.reporter);
+  const summary = asRecord(ticket.summary5W1H);
+  const legacyName = asString(ticket.reporterName, 'ไม่ระบุชื่อ');
+  const legacyPhone = asString(ticket.phone);
+  const reporterName = asString(reporter.name, legacyName);
+  const reporterPhone = asString(reporter.phone, legacyPhone);
+  const itemName = asString(ticket.itemName, 'ไม่ระบุรายการ');
+  const problemDescription = asString(ticket.problemDescription, asString(ticket.detail));
+  const floor = asString(location.floor, 'ไม่ระบุชั้น');
+  const roomOrArea = asString(location.roomOrArea, 'ไม่ระบุพื้นที่');
+  const createdAt = asString(ticket.createdAt, asString(ticket.updatedAt, new Date().toISOString()));
+  const status = ticket.status;
+  const validStatuses: TicketStatus[] = ['pending', 'in_progress', 'waiting_parts', 'completed', 'cancelled'];
+  const reporterRole = reporter.role;
+  const preferredNotifyChannel = reporter.preferredNotifyChannel;
+  const statusSummary = {
+    who: `${reporterName}${reporterPhone ? ` โทร ${reporterPhone}` : ''}`,
+    what: `${itemName}${problemDescription ? `: ${problemDescription}` : ''}`,
+    where: `${floor} ${roomOrArea}`,
+    when: createdAt,
+    why: problemDescription,
+    how: asString(ticket.repairNotes, 'รอเจ้าหน้าที่ตรวจสอบ'),
+  };
+
+  return {
+    ...ticket,
+    id: asString(ticket.id, `LEGACY-${index + 1}`),
+    createdAt,
+    updatedAt: asString(ticket.updatedAt, createdAt),
+    categoryId: asString(ticket.categoryId, 'legacy'),
+    categoryName: asString(ticket.categoryName, 'ไม่ระบุหมวดหมู่'),
+    itemId: asString(ticket.itemId, 'legacy'),
+    itemName,
+    location: {
+      floor,
+      roomOrArea,
+      specificDetail: asString(location.specificDetail) || undefined,
+    },
+    urgency: ticket.urgency === 'urgent' || ticket.urgency === 'critical' ? ticket.urgency : 'normal',
+    problemDescription,
+    photos: Array.isArray(ticket.photos) ? ticket.photos.filter((photo): photo is string => typeof photo === 'string') : [],
+    reporter: {
+      name: reporterName,
+      role: reporterRole === 'faculty' || reporterRole === 'staff' || reporterRole === 'student' || reporterRole === 'external' || reporterRole === 'other'
+        ? reporterRole
+        : 'other',
+      department: asString(reporter.department, asString(ticket.department)) || undefined,
+      phone: reporterPhone,
+      email: asString(reporter.email, asString(ticket.email)) || undefined,
+      lineId: asString(reporter.lineId, asString(ticket.lineId)) || undefined,
+      preferredNotifyChannel: preferredNotifyChannel === 'phone' || preferredNotifyChannel === 'line' || preferredNotifyChannel === 'sms'
+        ? preferredNotifyChannel
+        : 'email',
+    },
+    status: validStatuses.includes(status as TicketStatus) ? status as TicketStatus : 'pending',
+    summary5W1H: {
+      who: asString(summary.who, statusSummary.who),
+      what: asString(summary.what, statusSummary.what),
+      where: asString(summary.where, statusSummary.where),
+      when: asString(summary.when, statusSummary.when),
+      why: asString(summary.why, statusSummary.why),
+      how: asString(summary.how, statusSummary.how),
+    },
+    executiveDirectives: Array.isArray(ticket.executiveDirectives) ? ticket.executiveDirectives : [],
+    reporterNotifiedHistory: Array.isArray(ticket.reporterNotifiedHistory) ? ticket.reporterNotifiedHistory : [],
+  } as MaintenanceTicket;
+}
 
 function getScriptUrl(): string {
   try {
@@ -63,21 +144,32 @@ async function writeToSheets(key: string, value: string, notify?: { email: strin
 }
 
 export async function sendEmailNotification(email: string, subject: string, body: string): Promise<void> {
-  const url = getScriptUrl();
-  if (!url) return;
-  writeToSheets('__email', '', { email, subject, body });
+  await postNotification({
+    key: '__email',
+    value: '',
+    notifyEmail: email,
+    notifySubject: subject,
+    notifyBody: body,
+  });
 }
 
 export async function sendGoogleChatViaSheets(text: string): Promise<void> {
-  const url = getScriptUrl();
-  if (!url) return;
-  try {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url);
-    xhr.setRequestHeader('Content-Type', 'text/plain');
-    xhr.send(JSON.stringify({ key: '__gchat', value: text }));
-  } catch (e) {
-    console.warn('[Google Sheets] Failed to send Google Chat:', e);
+  await postNotification({ key: '__gchat', value: text });
+}
+
+async function postNotification(payload: Record<string, string>): Promise<void> {
+  const response = await fetch(getScriptUrl(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`Notification service returned HTTP ${response.status}`);
+  }
+
+  const result = await response.json() as { success?: boolean; error?: string };
+  if (!result.success) {
+    throw new Error(result.error || 'Notification service did not confirm delivery');
   }
 }
 
@@ -103,8 +195,9 @@ export async function syncTicketsFromSheets(): Promise<MaintenanceTicket[] | nul
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
-      localStorage.setItem(STORAGE_KEYS.TICKETS, raw);
-      return parsed as MaintenanceTicket[];
+      const tickets = parsed.map((ticket: unknown, index: number) => normalizeTicket(ticket, index));
+      localStorage.setItem(STORAGE_KEYS.TICKETS, JSON.stringify(tickets));
+      return tickets;
     }
   } catch { /* ignore */ }
   return null;
@@ -147,6 +240,7 @@ export function loadCategories(): MaintenanceCategory[] {
 export function saveCategories(categories: MaintenanceCategory[]) {
   try {
     const raw = JSON.stringify(categories);
+    if (localStorage.getItem(STORAGE_KEYS.CATEGORIES) === raw) return;
     localStorage.setItem(STORAGE_KEYS.CATEGORIES, raw);
     if (isGoogleSheetsConfigured()) {
       writeToSheets('categories', raw);
@@ -162,16 +256,17 @@ export function loadTickets(): MaintenanceTicket[] {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        const existingIds = new Set(parsed.map((t: any) => t.id));
+        const tickets = parsed.map((ticket: unknown, index: number) => normalizeTicket(ticket, index));
+        const existingIds = new Set(tickets.map((ticket) => ticket.id));
         const missingInitials = INITIAL_TICKETS.filter((t) => !existingIds.has(t.id));
 
-        let result = missingInitials.length > 0 ? [...parsed, ...missingInitials] : parsed;
+        let result = missingInitials.length > 0 ? [...tickets, ...missingInitials] : tickets;
 
-        const hasAnyDirectives = result.some((t: any) => t.executiveDirectives && t.executiveDirectives.length > 0);
+        const hasAnyDirectives = result.some((ticket) => ticket.executiveDirectives && ticket.executiveDirectives.length > 0);
         if (!hasAnyDirectives) {
-          result = result.map((t: MaintenanceTicket) => {
-            const init = INITIAL_TICKETS.find(it => it.id === t.id);
-            return init?.executiveDirectives ? { ...t, executiveDirectives: init.executiveDirectives } : t;
+          result = result.map((ticket) => {
+            const init = INITIAL_TICKETS.find((item) => item.id === ticket.id);
+            return init?.executiveDirectives ? { ...ticket, executiveDirectives: init.executiveDirectives } : ticket;
           });
         }
         return result;
@@ -187,7 +282,9 @@ export function saveTickets(tickets: MaintenanceTicket[]) {
   try {
     const raw = JSON.stringify(tickets);
     const initRaw = JSON.stringify(INITIAL_TICKETS);
-    const hasData = localStorage.getItem(STORAGE_KEYS.TICKETS) !== null;
+    const storedRaw = localStorage.getItem(STORAGE_KEYS.TICKETS);
+    if (storedRaw === raw) return;
+    const hasData = storedRaw !== null;
     if (hasData && raw === initRaw) return;
     localStorage.setItem(STORAGE_KEYS.TICKETS, raw);
     // ห้ามเขียน INITIAL_TICKETS ทับ Sheet (กันข้อมูลผู้ใช้หาย)
@@ -221,6 +318,7 @@ export function loadOfficer(): OfficerProfile {
 export function saveOfficer(officer: OfficerProfile) {
   try {
     const raw = JSON.stringify(officer);
+    if (localStorage.getItem(STORAGE_KEYS.OFFICER) === raw) return;
     localStorage.setItem(STORAGE_KEYS.OFFICER, raw);
     if (isGoogleSheetsConfigured()) {
       writeToSheets('officer', raw);
@@ -236,6 +334,7 @@ export function loadWebhookUrl(): string {
 
 export function saveWebhookUrl(url: string) {
   try {
+    if (localStorage.getItem(STORAGE_KEYS.WEBHOOK_URL) === url) return;
     localStorage.setItem(STORAGE_KEYS.WEBHOOK_URL, url);
     if (url && isGoogleSheetsConfigured()) {
       writeToSheets('webhookUrl', url);
@@ -259,6 +358,7 @@ export function loadSuperAdminEmails(): string[] {
 export function saveSuperAdminEmails(emails: string[]) {
   try {
     const raw = JSON.stringify(emails);
+    if (localStorage.getItem(STORAGE_KEYS.SUPER_ADMIN_EMAILS) === raw) return;
     localStorage.setItem(STORAGE_KEYS.SUPER_ADMIN_EMAILS, raw);
     if (isGoogleSheetsConfigured()) {
       writeToSheets('superAdminEmails', raw);
@@ -295,6 +395,7 @@ export function loadSystemRatings(): SystemRating[] {
 export function saveSystemRatings(ratings: SystemRating[]) {
   try {
     const raw = JSON.stringify(ratings);
+    if (localStorage.getItem(STORAGE_KEYS.SYSTEM_RATINGS) === raw) return;
     localStorage.setItem(STORAGE_KEYS.SYSTEM_RATINGS, raw);
     if (isGoogleSheetsConfigured()) {
       writeToSheets('systemRatings', raw);
