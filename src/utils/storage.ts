@@ -111,8 +111,21 @@ async function fetchFromSheets(key: string): Promise<string | null> {
   if (!url) return null;
   try {
     const res = await fetch(`${url}?key=${encodeURIComponent(key)}`);
-    const json = await res.json();
-    return json.data ?? null;
+    const json = await res.json() as {
+      data?: unknown;
+      tickets?: unknown;
+      result?: string;
+      message?: string;
+    };
+    if (!res.ok || json.result === 'error') {
+      throw new Error(json.message || `Google Sheets service returned HTTP ${res.status}`);
+    }
+
+    const value = json.data && typeof json.data === 'object' && !Array.isArray(json.data)
+      ? (json.data as Record<string, unknown>)[key]
+      : json.data ?? (key === 'tickets' ? json.tickets : undefined);
+    if (value === undefined || value === null) return null;
+    return typeof value === 'string' ? value : JSON.stringify(value);
   } catch (e) {
     console.warn(`[Google Sheets] Failed to fetch "${key}":`, e);
     return null;
@@ -121,26 +134,37 @@ async function fetchFromSheets(key: string): Promise<string | null> {
 
 async function writeToSheets(key: string, value: string, notify?: { email: string; subject: string; body: string }): Promise<void> {
   const url = getScriptUrl();
-  if (!url) return;
-  const body: any = { key, value };
+  if (!url) throw new Error('Google Sheets API URL is not configured');
+  const body: Record<string, string> = { key, value };
   if (notify) {
     body.notifyEmail = notify.email;
     body.notifySubject = notify.subject;
     body.notifyBody = notify.body;
   }
-  const raw = JSON.stringify(body);
-  // XMLHttpRequest: ส่ง POST ข้าม origin ได้ (แม้ CORS block การอ่าน response, request ไปถึง server)
-  // สำหรับ simple request (POST + text/plain) browser ไม่ส่ง preflight OPTIONS
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify(body),
+  });
+  const responseText = await response.text();
+  let result: { success?: boolean; result?: string; error?: string; message?: string };
   try {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url);
-    xhr.setRequestHeader('Content-Type', 'text/plain');
-    xhr.send(raw);
-  } catch (e) {
-    console.warn(`[Google Sheets] Failed to write "${key}":`, e);
-    // Fallback
-    try { navigator.sendBeacon(url, raw); } catch {}
+    result = JSON.parse(responseText) as { success?: boolean; result?: string; error?: string; message?: string };
+  } catch {
+    throw new Error(`Google Sheets service returned an invalid response (HTTP ${response.status})`);
   }
+  if (!response.ok) {
+    throw new Error(result.error || result.message || `Google Sheets service returned HTTP ${response.status}`);
+  }
+  if (!result.success && result.result !== 'success') {
+    throw new Error(result.error || result.message || `Google Sheets service did not confirm saving "${key}"`);
+  }
+}
+
+function writeToSheetsInBackground(key: string, value: string): void {
+  void writeToSheets(key, value).catch((error: unknown) => {
+    console.error(`[Google Sheets] Failed to save "${key}":`, error);
+  });
 }
 
 export async function sendEmailNotification(email: string, subject: string, body: string): Promise<void> {
@@ -194,9 +218,8 @@ export async function syncTicketsFromSheets(): Promise<MaintenanceTicket[] | nul
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length > 0) {
+    if (Array.isArray(parsed)) {
       const tickets = parsed.map((ticket: unknown, index: number) => normalizeTicket(ticket, index));
-      localStorage.setItem(STORAGE_KEYS.TICKETS, JSON.stringify(tickets));
       return tickets;
     }
   } catch { /* ignore */ }
@@ -243,7 +266,7 @@ export function saveCategories(categories: MaintenanceCategory[]) {
     if (localStorage.getItem(STORAGE_KEYS.CATEGORIES) === raw) return;
     localStorage.setItem(STORAGE_KEYS.CATEGORIES, raw);
     if (isGoogleSheetsConfigured()) {
-      writeToSheets('categories', raw);
+      writeToSheetsInBackground('categories', raw);
     }
   } catch (e) {
     console.error('Error saving categories', e);
@@ -278,22 +301,48 @@ export function loadTickets(): MaintenanceTicket[] {
   return INITIAL_TICKETS;
 }
 
-export function saveTickets(tickets: MaintenanceTicket[]) {
+let lastSuccessfullySavedTickets: string | null = null;
+let pendingTicketsSave: { raw: string; promise: Promise<void> } | null = null;
+let ticketsWriteQueue: Promise<void> = Promise.resolve();
+
+export function saveTickets(tickets: MaintenanceTicket[]): Promise<void> {
+  const raw = JSON.stringify(tickets);
+  const initRaw = JSON.stringify(INITIAL_TICKETS);
+  let storedRaw: string | null = null;
   try {
-    const raw = JSON.stringify(tickets);
-    const initRaw = JSON.stringify(INITIAL_TICKETS);
-    const storedRaw = localStorage.getItem(STORAGE_KEYS.TICKETS);
-    if (storedRaw === raw) return;
-    const hasData = storedRaw !== null;
-    if (hasData && raw === initRaw) return;
-    localStorage.setItem(STORAGE_KEYS.TICKETS, raw);
-    // ห้ามเขียน INITIAL_TICKETS ทับ Sheet (กันข้อมูลผู้ใช้หาย)
-    if (isGoogleSheetsConfigured() && raw !== initRaw) {
-      writeToSheets('tickets', raw);
-    }
-  } catch (e) {
-    console.error('Error saving tickets', e);
+    storedRaw = localStorage.getItem(STORAGE_KEYS.TICKETS);
+  } catch (error) {
+    console.error('Unable to read tickets from localStorage; continuing with remote persistence', error);
   }
+  const hasData = storedRaw !== null;
+  if (hasData && raw === initRaw) return Promise.resolve();
+
+  if (storedRaw !== raw) {
+    try {
+      localStorage.setItem(STORAGE_KEYS.TICKETS, raw);
+    } catch (error) {
+      console.error('Unable to cache tickets in localStorage; continuing with remote persistence', error);
+      if (!isGoogleSheetsConfigured()) return Promise.reject(error);
+    }
+  }
+
+  if (!isGoogleSheetsConfigured() || raw === initRaw || lastSuccessfullySavedTickets === raw) {
+    return Promise.resolve();
+  }
+  if (pendingTicketsSave?.raw === raw) return pendingTicketsSave.promise;
+
+  const promise = ticketsWriteQueue
+    .catch(() => undefined)
+    .then(() => writeToSheets('tickets', raw))
+    .then(() => {
+      lastSuccessfullySavedTickets = raw;
+    })
+    .finally(() => {
+      if (pendingTicketsSave?.promise === promise) pendingTicketsSave = null;
+    });
+  ticketsWriteQueue = promise;
+  pendingTicketsSave = { raw, promise };
+  return promise;
 }
 
 export function loadOfficer(): OfficerProfile {
@@ -321,7 +370,7 @@ export function saveOfficer(officer: OfficerProfile) {
     if (localStorage.getItem(STORAGE_KEYS.OFFICER) === raw) return;
     localStorage.setItem(STORAGE_KEYS.OFFICER, raw);
     if (isGoogleSheetsConfigured()) {
-      writeToSheets('officer', raw);
+      writeToSheetsInBackground('officer', raw);
     }
   } catch (e) {
     console.error('Error saving officer', e);
@@ -329,18 +378,22 @@ export function saveOfficer(officer: OfficerProfile) {
 }
 
 export function loadWebhookUrl(): string {
+  // Google Chat webhook URLs must never be read from browser storage.
+  // Purge any stale value to avoid accidentally exposing sensitive credentials.
+  try {
+    localStorage.removeItem(STORAGE_KEYS.WEBHOOK_URL);
+  } catch {
+    // ignore cleanup failures; the value must never be surfaced to the UI
+  }
   return '';
 }
 
-export function saveWebhookUrl(url: string) {
+export function saveWebhookUrl(_url: string) {
+  // Never persist the Google Chat webhook in the browser; this is a secret.
   try {
-    if (localStorage.getItem(STORAGE_KEYS.WEBHOOK_URL) === url) return;
-    localStorage.setItem(STORAGE_KEYS.WEBHOOK_URL, url);
-    if (url && isGoogleSheetsConfigured()) {
-      writeToSheets('webhookUrl', url);
-    }
+    localStorage.removeItem(STORAGE_KEYS.WEBHOOK_URL);
   } catch (e) {
-    console.error('Error saving webhook URL', e);
+    console.error('Error clearing webhook URL from localStorage', e);
   }
 }
 
@@ -361,7 +414,7 @@ export function saveSuperAdminEmails(emails: string[]) {
     if (localStorage.getItem(STORAGE_KEYS.SUPER_ADMIN_EMAILS) === raw) return;
     localStorage.setItem(STORAGE_KEYS.SUPER_ADMIN_EMAILS, raw);
     if (isGoogleSheetsConfigured()) {
-      writeToSheets('superAdminEmails', raw);
+      writeToSheetsInBackground('superAdminEmails', raw);
     }
   } catch (e) {
     console.error('Error saving super admin emails', e);
@@ -398,7 +451,7 @@ export function saveSystemRatings(ratings: SystemRating[]) {
     if (localStorage.getItem(STORAGE_KEYS.SYSTEM_RATINGS) === raw) return;
     localStorage.setItem(STORAGE_KEYS.SYSTEM_RATINGS, raw);
     if (isGoogleSheetsConfigured()) {
-      writeToSheets('systemRatings', raw);
+      writeToSheetsInBackground('systemRatings', raw);
     }
   } catch (e) {
     console.error('Error saving system ratings', e);
@@ -427,7 +480,9 @@ export function exportAllData(): string {
     if (c) data.categories = JSON.parse(c);
     const o = localStorage.getItem(STORAGE_KEYS.OFFICER);
     if (o) data.officer = JSON.parse(o);
-    // ยกเลิกการส่งออก webhookUrl เพื่อความปลอดภัย
+    const r = localStorage.getItem(STORAGE_KEYS.SYSTEM_RATINGS);
+    if (r) data.systemRatings = JSON.parse(r);
+    // Never export the webhook URL to avoid leaking a secret.
     const e = localStorage.getItem(STORAGE_KEYS.SUPER_ADMIN_EMAILS);
     if (e) data.superAdminEmails = JSON.parse(e);
     data.exportedAt = new Date().toISOString();
@@ -447,8 +502,12 @@ export function importAllData(json: string): boolean {
     if (data.officer) {
       localStorage.setItem(STORAGE_KEYS.OFFICER, JSON.stringify(data.officer));
     }
+    if (data.systemRatings && Array.isArray(data.systemRatings)) {
+      localStorage.setItem(STORAGE_KEYS.SYSTEM_RATINGS, JSON.stringify(data.systemRatings));
+    }
+    // Never restore a webhook URL from exported data; this must remain server-side only.
     if (data.webhookUrl) {
-      localStorage.setItem(STORAGE_KEYS.WEBHOOK_URL, data.webhookUrl);
+      localStorage.removeItem(STORAGE_KEYS.WEBHOOK_URL);
     }
     if (data.superAdminEmails && Array.isArray(data.superAdminEmails)) {
       localStorage.setItem(STORAGE_KEYS.SUPER_ADMIN_EMAILS, JSON.stringify(data.superAdminEmails));
